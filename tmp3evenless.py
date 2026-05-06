@@ -774,7 +774,7 @@ class FlameBatchJsonEditor(QtWidgets.QDialog):
                 self.entries[key] = combo_widget
                 continue
             
-            if key in ["CO_PosPrompt", "CO_Neg_Prompt", "CO_NegPrompt"]:
+            if key in ["CO_PosPrompt", "CO_NegPrompt"]:
                 text_widget = QtWidgets.QPlainTextEdit(val_str)
                 text_widget.setMinimumHeight(80) 
                 text_widget.setMaximumHeight(200) 
