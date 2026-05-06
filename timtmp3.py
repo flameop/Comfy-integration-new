@@ -1,33 +1,608 @@
+# -*- coding: utf-8 -*-
 from __future__ import print_function
-import json
-import os
-import datetime
-import re
-import flame
 
-# Flame supports PySide6 in newer versions, PySide2 in older ones
+"""
+ComfyUI Integration for Flame
+Version: 2.7.3 - Merged Script (Base Integration + Profile Editor)
+
+Description:
+  Export clips to ComfyUI, manage workflows, send JSON profiles as jobs, 
+  and track metadata via sidecar/note nodes.
+"""
+
+import os
+import re
+import time
+import datetime
+import json
+import platform
+import socket
+import urllib.request
+import urllib.error
+
+try:
+    import flame
+except ImportError:
+    flame = None
+
+# Support both PySide6 (Newer Flame) and PySide2 (Older Flame)
 try:
     from PySide6 import QtWidgets, QtCore, QtGui
 except ImportError:
     from PySide2 import QtWidgets, QtCore, QtGui
 
-# Updated persistent storage path for ComfyUI profiles
-DIRECTORY_PATH = "/01_OUTPOST_STORE/01_OUTPOST/02_POST/ComfyUI/workflows/CO_FlameIntegrations/CO_Profiles"
+try:
+    import comfy_watcher
+except ImportError:
+    comfy_watcher = None
+    print("[ComfyUI] Warning: comfy_watcher not available")
+
+# ================== GLOBALS & CONSTANTS ==================
+
+__version__ = "2.7.3"
+
+_HOME = os.path.expanduser("~")
+_IS_LINUX = platform.system() == 'Linux'
+
+if _IS_LINUX:
+    _COMFY_BASE = os.path.join(_HOME, "ComfyUI")
+else:
+    _COMFY_BASE = os.path.join(_HOME, "Documents", "ComfyUI")
+
+# Persistent storage path for ComfyUI JSON profiles
+CO_PROFILES_DIR = "/01_OUTPOST_STORE/01_OUTPOST/02_POST/ComfyUI/workflows/CO_FlameIntegrations/CO_Profiles"
+
+DEFAULT_CONFIG = {
+    "comfy_url": "http://127.0.0.1",
+    "comfy_port": 8188 if _IS_LINUX else 8000,
+    "comfy_input_dir": os.path.join(_COMFY_BASE, "input", "Flame_outputs"),
+    "comfy_output_dir": os.path.join(_COMFY_BASE, "output", "flame_returns"),
+    "preset_path": "/opt/Autodesk/shared/python/comfy_integration/export_presets/EXPORT_PNG_COMFYUI.xml",
+    "export_format": "PNG 8-bit",
+    "presets_dir": "/opt/Autodesk/shared/python/comfy_integration/export_presets",
+    "workflows_dir": os.path.join(_COMFY_BASE, "flame_comfy_workflows"),
+    "pipeline_export_path": "",
+    "pipeline_result_path": "",
+    "output_format": "png",
+    "output_quality": 95,
+    "colorspace": "default",
+    "timeout": 300,
+    "auto_import": True,
+    "import_destination": "batch",
+    "open_browser_manual": True,
+    "show_notifications": True,
+    "connection_mode": "local",
+    "remote_ssh_host": "user@remote-host",
+    "remote_path": "/home/user/ComfyUI/input/Flame_outputs",
+}
+
+EXPORT_PRESETS = {
+    "PNG 8-bit": "EXPORT_PNG_COMFYUI.xml",
+    "PNG 16-bit": "EXPORT_PNG16_COMFYUI.xml",
+    "EXR 16-bit float": "EXPORT_EXR_COMFYUI.xml",
+    "EXR 32-bit float": "EXPORT_EXR32_COMFYUI.xml",
+    "JPEG 8-bit": "EXPORT_JPEG_COMFYUI.xml",
+}
+
+FILE_WAIT_TIMEOUT = 60
+
+# ================== LOGGING & UTILITIES ==================
+
+def log(msg):
+    """Standardized logging function"""
+    x = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[ComfyUI] {x}: {msg}")
+
+def sanitize_filename(name):
+    """Sanitize filename"""
+    return re.sub(r'[<>:"/\\|?*]', "_", name)
+
+def sanitize_hostname(name):
+    """Sanitize hostname by removing non-alphanumeric characters except dots and hyphens"""
+    return re.sub(r'[^a-zA-Z0-9.-]', "_", name)
+
+# ================== CONFIGURATION MANAGEMENT ==================
+
+class ConfigManager:
+    """Centralized configuration manager (Singleton pattern)"""
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(ConfigManager, cls).__new__(cls)
+            cls._instance._config_file = os.path.expanduser("~/.flame_comfy_config.json")
+            cls._instance.config = cls._instance._load_config()
+        return cls._instance
+    
+    def _load_config(self):
+        config = DEFAULT_CONFIG.copy()
+        if os.path.exists(self._config_file):
+            try:
+                with open(self._config_file, 'r') as f:
+                    user_config = json.load(f)
+                    config.update(user_config)
+            except Exception as e:
+                log(f"Config load error: {e}")
+        return config
+    
+    def save_config(self, new_config=None):
+        if new_config:
+            self.config.update(new_config)
+        try:
+            with open(self._config_file, 'w') as f:
+                json.dump(self.config, f, indent=2)
+            log(f"Configuration saved: {self._config_file}")
+            return True
+        except Exception as e:
+            log(f"Config save error: {e}")
+            return False
+
+    def reload(self):
+        self.config = self._load_config()
+
+    def get(self, key, default=None):
+        return self.config.get(key, default)
+
+    @property
+    def url(self):
+        return f"{self.config['comfy_url'].rstrip('/')}:{self.config['comfy_port']}"
+        
+    @property
+    def input_dir(self):
+        return self.config['comfy_input_dir']
+        
+    @property
+    def output_dir(self):
+        return self.config['comfy_output_dir']
+
+    @property
+    def notification_file(self):
+        return os.path.join(self.output_dir, 'notification.json')
+
+    @property
+    def pipeline_notification_file(self):
+        pipe_res = self.config.get('pipeline_result_path', '')
+        if pipe_res:
+            return os.path.join(pipe_res, 'notification.json')
+        return None
+
+    @property
+    def workflows_dir(self):
+        return self.config['workflows_dir']
+
+    def get_preset_path(self, export_format):
+        presets_dir = self.config.get('presets_dir', DEFAULT_CONFIG['presets_dir'])
+        preset_file = EXPORT_PRESETS.get(export_format, '')
+        if preset_file:
+            return os.path.join(presets_dir, preset_file)
+        return self.config.get('preset_path', DEFAULT_CONFIG['preset_path'])
+
+
+# ================== FLAME CONTEXT & UTILS ==================
+
+def _get_flame_attr_str(attr):
+    """Safely extract string from a Flame attribute, stripping quotes"""
+    try:
+        val = str(attr.get_value()) if hasattr(attr, 'get_value') else str(attr)
+        return val.strip("'\"")
+    except Exception:
+        return ''
+
+def get_mux_notes():
+    """Returns parsed notes from the first Mux Note node in the current Batch selection."""
+    try:
+        if not flame or not hasattr(flame, 'batch') or not flame.batch:
+            return None
+        selection = flame.batch.selected_nodes.get_value()
+        for node in selection:
+            if node.type == "Note":
+                notetext = node.note.get_value()
+                return _parse_note_text(notetext)
+    except Exception as e:
+        log(f"Error accessing Mux notes: {e}")
+    return None
+
+def _parse_note_text(raw_string):
+    """Parses a string with (KEY) VALUE formatting."""
+    pattern = r'^[ \t]*\(([^)]+)\)[ \t]*(.*?)(?=(?:^[ \t]*\()|\Z)'
+    matches = re.findall(pattern, raw_string, flags=re.MULTILINE | re.DOTALL)
+    return {key.strip(): value.strip() for key, value in matches}
+
+def get_clip_from_item(item):
+    """Extract PyClip from different Flame object types robustly"""
+    if not flame: return None
+    try:
+        # If it's directly a clip/sequence (has duration but no type)
+        if hasattr(item, 'duration') and not hasattr(item, 'type'):
+            return item
+        # If it's a node containing media
+        for attr in ['clip', 'source', 'media', 'sequence', 'input']:
+            if hasattr(item, attr):
+                val = getattr(item, attr)
+                if val and hasattr(val, 'duration'):
+                    return val
+    except Exception as e:
+        log(f"Error parsing item to clip: {e}")
+    return None
+
+def _safe_int_from_pytime(val):
+    """Safely extract an integer from a Flame PyTime, attribute, or plain value."""
+    try:
+        if hasattr(val, 'get_value'):
+            val = val.get_value()
+        if hasattr(val, 'frame'):
+            return int(val.frame)
+        if hasattr(val, 'relative_frame'):
+            return int(val.relative_frame)
+        return int(val)
+    except Exception:
+        return 1
+
+# ================== UI UTILITIES & BASE CLASSES ==================
+
+class UIUtils:
+    PYFLAME_FONT = 'Discreet'
+    PYFLAME_FONT_SIZE = 13
+    
+    FLAME_BG = 'rgb(36, 36, 36)'
+    FLAME_MID_BG = 'rgb(45, 45, 45)'
+    FLAME_WIDGET_BG = 'rgb(58, 58, 58)'
+    FLAME_WIDGET_HOVER = 'rgb(71, 71, 71)'
+    FLAME_INPUT_BG = 'rgb(55, 65, 75)'
+    FLAME_INPUT_FOCUS = 'rgb(73, 86, 99)'
+    FLAME_TEXT = 'rgb(154, 154, 154)'
+    FLAME_TEXT_BRIGHT = 'rgb(210, 210, 210)'
+    FLAME_TEXT_DIM = 'rgb(100, 100, 100)'
+    FLAME_BLUE = 'rgb(0, 110, 175)'
+    FLAME_HIGHLIGHT = 'rgb(74, 158, 255)'
+    FLAME_BORDER = 'rgb(90, 90, 90)'
+    FLAME_DISABLED = 'rgb(54, 54, 54)'
+
+    @classmethod
+    def get_flame_stylesheet(cls):
+        """Return the standard PyFlame stylesheet for dialogs"""
+        return f"""
+            QDialog {{ background-color: {cls.FLAME_BG}; color: {cls.FLAME_TEXT}; font-family: '{cls.PYFLAME_FONT}'; font-size: {cls.PYFLAME_FONT_SIZE}px; }}
+            QLabel {{ color: {cls.FLAME_TEXT}; background-color: transparent; border: none; font-size: {cls.PYFLAME_FONT_SIZE}px; }}
+            QLabel#header {{ font-size: 15px; color: {cls.FLAME_TEXT_DIM}; font-weight: 300; }}
+            QLabel#section {{ font-size: {cls.PYFLAME_FONT_SIZE}px; color: {cls.FLAME_TEXT_DIM}; padding: 10px 0px 6px 0px; }}
+            QLineEdit, QPlainTextEdit, QTextEdit {{
+                color: {cls.FLAME_TEXT}; background-color: {cls.FLAME_INPUT_BG}; border: 1px solid {cls.FLAME_INPUT_BG};
+                selection-color: rgb(38, 38, 38); selection-background-color: rgb(184, 177, 167); padding: 6px 8px; font-size: {cls.PYFLAME_FONT_SIZE}px;
+            }}
+            QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus {{ background-color: {cls.FLAME_INPUT_FOCUS}; }}
+            QLineEdit:hover, QPlainTextEdit:hover, QTextEdit:hover {{ border: 1px solid {cls.FLAME_BORDER}; }}
+            QComboBox {{ background-color: {cls.FLAME_WIDGET_BG}; color: {cls.FLAME_TEXT}; border: 1px solid {cls.FLAME_BORDER}; padding: 4px 12px; font-size: {cls.PYFLAME_FONT_SIZE}px; }}
+            QComboBox:hover {{ border: 1px solid {cls.FLAME_HIGHLIGHT}; }}
+            QComboBox::drop-down {{ border: none; width: 20px; }}
+            QComboBox QAbstractItemView {{ background-color: {cls.FLAME_WIDGET_BG}; color: {cls.FLAME_TEXT}; selection-background-color: {cls.FLAME_BLUE}; selection-color: {cls.FLAME_TEXT_BRIGHT}; border: none; }}
+            QSpinBox {{ background-color: {cls.FLAME_INPUT_BG}; color: {cls.FLAME_TEXT}; border: 1px solid {cls.FLAME_INPUT_BG}; padding: 6px 8px; font-size: {cls.PYFLAME_FONT_SIZE}px; }}
+            QSpinBox:hover {{ border: 1px solid {cls.FLAME_BORDER}; }}
+            QSpinBox::up-button, QSpinBox::down-button {{ background-color: transparent; border: none; width: 16px; }}
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background-color: {cls.FLAME_WIDGET_HOVER}; }}
+            QPushButton {{ background-color: {cls.FLAME_WIDGET_BG}; color: rgb(165, 165, 165); border: none; padding: 8px 20px; font-size: {cls.PYFLAME_FONT_SIZE}px; }}
+            QPushButton:hover {{ border: 1px solid {cls.FLAME_BORDER}; }}
+            QPushButton:pressed {{ color: {cls.FLAME_TEXT_BRIGHT}; background-color: {cls.FLAME_WIDGET_HOVER}; }}
+            QPushButton:focus {{ outline: none; border: none; }}
+            QPushButton#primary {{ background-color: {cls.FLAME_BLUE}; color: rgb(185, 185, 185); }}
+            QPushButton#primary:hover {{ border: 1px solid {cls.FLAME_BORDER}; }}
+            QPushButton#primary:pressed {{ color: {cls.FLAME_TEXT_BRIGHT}; }}
+            QPushButton:disabled {{ color: {cls.FLAME_TEXT_DIM}; background-color: {cls.FLAME_DISABLED}; }}
+            QCheckBox {{ color: {cls.FLAME_TEXT}; spacing: 8px; font-size: {cls.PYFLAME_FONT_SIZE}px; }}
+            QCheckBox::indicator {{ width: 16px; height: 16px; background-color: {cls.FLAME_WIDGET_BG}; border: none; }}
+            QCheckBox::indicator:hover {{ background-color: {cls.FLAME_WIDGET_HOVER}; }}
+            QCheckBox::indicator:checked {{ background-color: {cls.FLAME_BLUE}; }}
+            QMessageBox {{ background-color: {cls.FLAME_BG}; color: {cls.FLAME_TEXT}; font-family: '{cls.PYFLAME_FONT}'; font-size: {cls.PYFLAME_FONT_SIZE}px; }}
+            QMessageBox QLabel {{ color: {cls.FLAME_TEXT}; font-size: {cls.PYFLAME_FONT_SIZE}px; }}
+            QMessageBox QPushButton {{ background-color: {cls.FLAME_WIDGET_BG}; color: rgb(165, 165, 165); border: none; padding: 6px 15px; min-width: 80px; }}
+            QMessageBox QPushButton:hover {{ border: 1px solid {cls.FLAME_BORDER}; }}
+        """
+
+class FlameBaseDialog(QtWidgets.QDialog):
+    """Base class for standard Flame-styled settings dialogs"""
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setStyleSheet(UIUtils.get_flame_stylesheet())
+        self.main_layout = QtWidgets.QVBoxLayout(self)
+        self.main_layout.setSpacing(12)
+        self.main_layout.setContentsMargins(24, 24, 24, 24)
+
+    def add_header(self, text):
+        lbl = QtWidgets.QLabel(text)
+        lbl.setObjectName("header")
+        self.main_layout.addWidget(lbl)
+        return lbl
+
+    def add_section_label(self, text):
+        lbl = QtWidgets.QLabel(text)
+        lbl.setObjectName("section")
+        self.main_layout.addWidget(lbl)
+        return lbl
+
+    def create_standard_buttons(self, ok_text="OK", cancel_text="Cancel", on_ok=None, on_cancel=None):
+        btn_layout = QtWidgets.QHBoxLayout()
+        btn_layout.addStretch()
+        
+        cancel_btn = QtWidgets.QPushButton(cancel_text)
+        cancel_btn.setMinimumSize(110, 28)
+        cancel_btn.clicked.connect(on_cancel or self.reject)
+        btn_layout.addWidget(cancel_btn)
+        
+        ok_btn = QtWidgets.QPushButton(ok_text)
+        ok_btn.setObjectName("primary")
+        ok_btn.setMinimumSize(110, 28)
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(on_ok or self.accept)
+        btn_layout.addWidget(ok_btn)
+        
+        return btn_layout
+
+# ================== WORKFLOW MODIFIER ==================
+
+class WorkflowModifier:
+    """Handles parsing and injecting modifications into ComfyUI workflow JSON"""
+    
+    @staticmethod
+    def load_workflow(path):
+        try:
+            with open(path, 'r') as f:
+                workflow = json.load(f)
+            is_api = "nodes" not in workflow
+            return workflow, is_api
+        except Exception as e:
+            log(f"Error loading workflow: {e}")
+            return None, False
+
+    @staticmethod
+    def convert_to_api(workflow):
+        """Converts normal workflow to API format"""
+        log("Converting normal workflow to API format...")
+        api_workflow = {}
+        if "nodes" not in workflow:
+            return None
+            
+        for node in workflow["nodes"]:
+            node_id = str(node["id"])
+            api_workflow[node_id] = {"class_type": node["type"], "inputs": {}}
+            if node["type"] == "LoadImage" and node.get("widgets_values"):
+                api_workflow[node_id]["inputs"]["image"] = node["widgets_values"][0]
+                
+        if "links" in workflow:
+            for link in workflow["links"]:
+                if len(link) >= 5:
+                    t_node = str(link[3])
+                    t_slot = link[4]
+                    s_node = str(link[1])
+                    s_slot = link[2]
+                    if t_node in api_workflow:
+                        api_workflow[t_node]["inputs"][f"input_{t_slot}"] = [s_node, s_slot]
+        return api_workflow
+
+    @staticmethod
+    def inject_profile_path(workflow, is_api, profile_path):
+        """Injects the saved profile JSON path into the node 'CO_Profile_Sidecar_File'"""
+        target_title = "CO_Profile_Sidecar_File"
+        
+        if is_api:
+            for n_id, n_data in workflow.items():
+                if isinstance(n_data, dict):
+                    title = n_data.get('_meta', {}).get('title', '')
+                    if title == target_title:
+                        inputs = n_data.setdefault('inputs', {})
+                        found = False
+                        for key in ['file_path', 'path', 'string', 'value', 'text']:
+                            if key in inputs:
+                                inputs[key] = profile_path
+                                found = True
+                                break
+                        if not found:
+                            inputs['file_path'] = profile_path
+        else:
+            for node in workflow.get("nodes", []):
+                if node.get("title", node.get("type")) == target_title:
+                    if "widgets_values" not in node:
+                        node["widgets_values"] = [profile_path]
+                    elif len(node["widgets_values"]) > 0:
+                        node["widgets_values"][0] = profile_path
+                        
+        return workflow
+
+
+# ================== COMFYUI API WRAPPER ==================
+
+class ComfyAPI:
+    """Wraps HTTP and CDP interactions with ComfyUI."""
+    
+    @staticmethod
+    def test_connection(url):
+        try:
+            resp = urllib.request.urlopen(f"{url}/system_stats", timeout=5)
+            return resp.status == 200, None
+        except Exception as e:
+            return False, str(e)
+
+    @staticmethod
+    def execute_workflow(workflow, workflow_name):
+        cfg = ConfigManager()
+        url = cfg.url
+        try:
+            payload = json.dumps({"prompt": workflow}).encode('utf-8')
+            req = urllib.request.Request(
+                f"{url}/prompt", data=payload, headers={'Content-Type': 'application/json'}, method='POST'
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode('utf-8'))
+                if result:
+                    log(f"Workflow '{workflow_name}' executed. Prompt ID: {result.get('prompt_id', 'N/A')}")
+                    return True
+        except Exception as e:
+            log(f"API Execution Error: {e}")
+        return False
+
+    @staticmethod
+    def prepare_manual_workflow(workflow_path, workflow_name, clip_folder_name):
+        cfg = ConfigManager()
+        try:
+            with open(workflow_path, 'r') as f:
+                workflow = json.load(f)
+                
+            if 'nodes' in workflow:
+                for node in workflow.get('nodes', []):
+                    if node.get('type') == 'LoadExrSequence' and 'widgets_values' in node:
+                        node['widgets_values'][0] = False
+                        node['widgets_values'][1] = clip_folder_name
+                        
+            base = cfg.input_dir.rsplit('/input', 1)[0] if '/input' in cfg.input_dir else cfg.input_dir
+            temp_dir = os.path.join(base, 'user', 'default', 'workflows', 'flame_temp')
+            os.makedirs(temp_dir, exist_ok=True)
+            temp_name = f"{clip_folder_name}.json"
+            temp_path = os.path.join(temp_dir, temp_name)
+            
+            with open(temp_path, 'w') as f:
+                json.dump(workflow, f, indent=2)
+                
+            log(f"Manual workflow prepped: {temp_path}")
+            return temp_name
+        except Exception as e:
+            log(f"Error prepping manual workflow: {e}")
+            return None
+
+
+# ================== DIALOGS: SETTINGS ==================
+
+class ComfyUISettingsDialog(FlameBaseDialog):
+    def __init__(self, parent=None):
+        super().__init__("ComfyUI Integration - Settings", parent)
+        self.cfg = ConfigManager()
+        self.setup_ui()
+
+    def setup_ui(self):
+        self.add_header(f"ComfyUI Integration Settings v{__version__}")
+        
+        # --- Connection Section ---
+        self.add_section_label("Connection")
+        conn_layout = QtWidgets.QVBoxLayout()
+        
+        conn_form = QtWidgets.QFormLayout()
+        self.url_input = QtWidgets.QLineEdit(self.cfg.get('comfy_url'))
+        self.port_input = QtWidgets.QSpinBox()
+        self.port_input.setRange(1000, 65535)
+        self.port_input.setValue(self.cfg.get('comfy_port'))
+        conn_form.addRow("URL:", self.url_input)
+        conn_form.addRow("Port:", self.port_input)
+        conn_layout.addLayout(conn_form)
+        
+        self.test_btn = QtWidgets.QPushButton("Test Connection")
+        self.test_btn.clicked.connect(self.test_server_connection)
+        
+        test_btn_layout = QtWidgets.QHBoxLayout()
+        test_btn_layout.addStretch()
+        test_btn_layout.addWidget(self.test_btn)
+        conn_layout.addLayout(test_btn_layout)
+        
+        self.main_layout.addLayout(conn_layout)
+        
+        # --- Export Settings Section ---
+        self.add_section_label("Export & Media")
+        export_form = QtWidgets.QFormLayout()
+        
+        self.format_combo = QtWidgets.QComboBox()
+        self.format_combo.addItems(list(EXPORT_PRESETS.keys()))
+        current_fmt = self.cfg.get('export_format', 'PNG 8-bit')
+        if current_fmt in EXPORT_PRESETS:
+            self.format_combo.setCurrentText(current_fmt)
+        export_form.addRow("Export Format:", self.format_combo)
+        
+        self.auto_import_cb = QtWidgets.QCheckBox("Auto-import back to Flame")
+        self.auto_import_cb.setChecked(self.cfg.get('auto_import', True))
+        export_form.addRow("", self.auto_import_cb)
+        
+        self.import_dest_combo = QtWidgets.QComboBox()
+        self.import_dest_combo.addItems(["batch", "media_panel"])
+        self.import_dest_combo.setCurrentText(self.cfg.get('import_destination', 'batch'))
+        export_form.addRow("Import Destination:", self.import_dest_combo)
+        
+        self.main_layout.addLayout(export_form)
+        
+        # --- Paths Section ---
+        self.add_section_label("Paths")
+        paths_form = QtWidgets.QFormLayout()
+        self.input_dir = QtWidgets.QLineEdit(self.cfg.input_dir)
+        self.output_dir = QtWidgets.QLineEdit(self.cfg.output_dir)
+        self.workflows_dir = QtWidgets.QLineEdit(self.cfg.workflows_dir)
+        
+        paths_form.addRow("ComfyUI Input:", self.input_dir)
+        paths_form.addRow("ComfyUI Output:", self.output_dir)
+        paths_form.addRow("Workflows Dir:", self.workflows_dir)
+        
+        self.pipe_res_path = QtWidgets.QLineEdit(self.cfg.get('pipeline_result_path', ''))
+        paths_form.addRow("Remote Export Path:", self.pipe_res_path)
+        
+        self.main_layout.addLayout(paths_form)
+        
+        self.main_layout.addStretch()
+        self.main_layout.addLayout(self.create_standard_buttons("Save", "Cancel", self.save_settings))
+
+    def test_server_connection(self):
+        url = self.url_input.text().rstrip('/')
+        port = self.port_input.value()
+        test_url = f"{url}:{port}"
+        
+        success, error = ComfyAPI.test_connection(test_url)
+        
+        msg = QtWidgets.QMessageBox(self)
+        msg.setStyleSheet(UIUtils.get_flame_stylesheet())
+        
+        if success:
+            msg.setWindowTitle("Connection Successful")
+            msg.setText(f"Successfully connected to ComfyUI at:\n{test_url}")
+            msg.setIcon(QtWidgets.QMessageBox.Information)
+        else:
+            msg.setWindowTitle("Connection Failed")
+            msg.setText(f"Failed to connect to ComfyUI at:\n{test_url}\n\nError: {error}")
+            msg.setIcon(QtWidgets.QMessageBox.Critical)
+            
+        try:
+            msg.exec_()
+        except AttributeError:
+            msg.exec()
+
+    def save_settings(self):
+        selected_format = self.format_combo.currentText()
+        settings_update = {
+            'comfy_url': self.url_input.text(),
+            'comfy_port': self.port_input.value(),
+            'comfy_input_dir': self.input_dir.text(),
+            'comfy_output_dir': self.output_dir.text(),
+            'workflows_dir': self.workflows_dir.text(),
+            'export_format': selected_format,
+            'preset_path': self.cfg.get_preset_path(selected_format),
+            'auto_import': self.auto_import_cb.isChecked(),
+            'import_destination': self.import_dest_combo.currentText(),
+            'pipeline_result_path': self.pipe_res_path.text()
+        }
+        
+        if self.cfg.save_config(settings_update):
+            log("Settings updated successfully.")
+            self.accept()
+
+
+# ================== DIALOGS: PROFILE EDITOR ==================
 
 class FlameBatchJsonEditor(QtWidgets.QDialog):
-    def __init__(self, selection=None, parent=None):
+    def __init__(self, selection=None, clip_data=None, parent=None):
         super().__init__(parent)
         
-        # Store the current selection for fallback placement coordinates
         self.selection = selection
+        self.clip_data = clip_data if clip_data is not None else []
         
         self.setWindowTitle("ComfyUI Workflows")
-        # Increased window size to give the right panel significantly more room
         self.resize(1300, 750)
-        self.setMinimumWidth(1000) # Prevents the window from being squished
+        self.setMinimumWidth(1000)
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
         
-        # Flame-like styling using Qt Stylesheets
+        # Specific styling for the profile editor dialog
         self.setStyleSheet("""
             QDialog { background-color: #2e2e2e; }
             QLabel { color: #9a9a9a; }
@@ -39,6 +614,9 @@ class FlameBatchJsonEditor(QtWidgets.QDialog):
             QPushButton:disabled { background-color: #333333; color: #666; }
             QScrollArea { border: none; background-color: #2e2e2e; }
             QWidget#scrollWidget { background-color: #2e2e2e; }
+            QComboBox { background-color: #111; color: #ef9d00; border: none; padding: 6px; }
+            QComboBox::drop-down { border: none; width: 20px; }
+            QComboBox QAbstractItemView { background-color: #1a1a1a; color: #ccc; selection-background-color: #464646; border: none; }
         """)
         
         self.current_file_path = None
@@ -94,7 +672,6 @@ class FlameBatchJsonEditor(QtWidgets.QDialog):
         self.scroll_widget.setObjectName("scrollWidget")
         
         self.form_layout = QtWidgets.QFormLayout(self.scroll_widget)
-        # Ensure the form layout fields stretch out as much as possible
         self.form_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.ExpandingFieldsGrow)
         self.scroll_area.setWidget(self.scroll_widget)
         
@@ -103,9 +680,9 @@ class FlameBatchJsonEditor(QtWidgets.QDialog):
         main_layout.addLayout(editor_layout, 1) 
 
     def scan_directory(self):
-        if not os.path.exists(DIRECTORY_PATH):
+        if not os.path.exists(CO_PROFILES_DIR):
             try:
-                os.makedirs(DIRECTORY_PATH)
+                os.makedirs(CO_PROFILES_DIR)
             except Exception as e:
                 QtWidgets.QMessageBox.warning(self, "Warning", f"Could not create directory:\n{e}")
                 return
@@ -114,15 +691,15 @@ class FlameBatchJsonEditor(QtWidgets.QDialog):
         self.sent_list.clear()
         
         # 1. Populate Main List
-        for f in sorted(os.listdir(DIRECTORY_PATH)):
-            if f.endswith('.json') and os.path.isfile(os.path.join(DIRECTORY_PATH, f)):
+        for f in sorted(os.listdir(CO_PROFILES_DIR)):
+            if f.endswith('.json') and os.path.isfile(os.path.join(CO_PROFILES_DIR, f)):
                 display_name = f.replace('-API_Profile.json', '')
                 item = QtWidgets.QListWidgetItem(display_name)
                 item.setData(QtCore.Qt.UserRole, f)
                 self.file_list.addItem(item)
                 
         # 2. Populate Sent List (Reverse sorted to show newest timestamps at the top)
-        sent_dir = os.path.join(DIRECTORY_PATH, "sent")
+        sent_dir = os.path.join(CO_PROFILES_DIR, "sent")
         if os.path.exists(sent_dir):
             for f in sorted(os.listdir(sent_dir), reverse=True):
                 if f.endswith('.json'):
@@ -155,14 +732,13 @@ class FlameBatchJsonEditor(QtWidgets.QDialog):
         if not selected_items: 
             return
             
-        # Quietly clear the selection in the sent list without triggering its event
         self.sent_list.blockSignals(True)
         self.sent_list.clearSelection()
         self.sent_list.blockSignals(False)
             
         item = selected_items[0]
         real_filename = item.data(QtCore.Qt.UserRole)
-        self.current_file_path = os.path.join(DIRECTORY_PATH, real_filename)
+        self.current_file_path = os.path.join(CO_PROFILES_DIR, real_filename)
         
         self.load_selected_file(real_filename)
 
@@ -171,14 +747,13 @@ class FlameBatchJsonEditor(QtWidgets.QDialog):
         if not selected_items:
             return
             
-        # Quietly clear the selection in the main list without triggering its event
         self.file_list.blockSignals(True)
         self.file_list.clearSelection()
         self.file_list.blockSignals(False)
         
         item = selected_items[0]
         real_filename = item.data(QtCore.Qt.UserRole)
-        self.current_file_path = os.path.join(DIRECTORY_PATH, "sent", real_filename)
+        self.current_file_path = os.path.join(CO_PROFILES_DIR, "sent", real_filename)
         
         self.load_selected_file(real_filename)
 
@@ -187,6 +762,18 @@ class FlameBatchJsonEditor(QtWidgets.QDialog):
         try:
             with open(self.current_file_path, 'r') as f:
                 self.data = json.load(f)
+                
+            # Automatically set CO_WorkstationName to the sanitized local hostname
+            workstation = sanitize_hostname(socket.gethostname().replace(".local", ""))
+            self.data["CO_WorkstationName"] = workstation
+            
+            # Overwrite CO_ReturnPath with the structured dynamic path
+            if "CO_ReturnPath" in self.data:
+                # Retrieve the clip name from the passed clip_data (defaults to 'UnknownClip' if empty)
+                clip_name_str = self.clip_data[0][0] if self.clip_data else "UnknownClip"
+                
+                self.data["CO_ReturnPath"] = f"/01_OUTPOST_STORE/01_OUTPOST/02_POST/ComfyUI/output/ToFlame_{workstation}/{clip_name_str}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}/"
+
             self.save_btn.setEnabled(True)
             self.refresh_ui()
         except json.JSONDecodeError:
@@ -205,8 +792,10 @@ class FlameBatchJsonEditor(QtWidgets.QDialog):
         
         self.entries = {}
         for key, value in self.data.items():
-            if key.endswith('ImageSrc'):
+            # Skip any keys with null values
+            if value is None:
                 continue
+                
             if key == "CO_WorkflowName":
                 continue
             
@@ -217,6 +806,22 @@ class FlameBatchJsonEditor(QtWidgets.QDialog):
                 continue
             
             val_str = str(value)
+            
+            # Use Dropdown if key targets Image Source Path
+            if key.endswith('ImageSrcPath'):
+                combo_widget = QtWidgets.QComboBox()
+                
+                # Extract just the filename/last folder name for cleaner display of the current JSON value
+                display_val = os.path.basename(val_str.replace('\\', '/').rstrip('/')) if isinstance(val_str, str) else val_str
+                combo_widget.addItem(f"Current: {display_val}", val_str) # Keep current JSON value as fallback
+                
+                # Append selected clips and their respective export paths passed cleanly from export stage
+                for c_name, c_path in self.clip_data:
+                    combo_widget.addItem(c_name, c_path)
+                    
+                self.form_layout.addRow(f"{key}:", combo_widget)
+                self.entries[key] = combo_widget
+                continue
             
             if key in ["CO_PosPrompt", "CO_Neg_Prompt", "CO_NegPrompt"]:
                 text_widget = QtWidgets.QPlainTextEdit(val_str)
@@ -230,7 +835,9 @@ class FlameBatchJsonEditor(QtWidgets.QDialog):
 
     def save_file(self):
         for key, entry in self.entries.items():
-            if isinstance(entry, QtWidgets.QPlainTextEdit):
+            if isinstance(entry, QtWidgets.QComboBox):
+                val = str(entry.currentData())
+            elif isinstance(entry, QtWidgets.QPlainTextEdit):
                 val = entry.toPlainText().strip()
             else:
                 val = entry.text().strip()
@@ -255,11 +862,9 @@ class FlameBatchJsonEditor(QtWidgets.QDialog):
             # Clean up existing timestamp suffix if the user resends an already-sent job
             base_name = re.sub(r'_\d{6}$', '', base_name)
             
-            # Formulate the new filename and node name
             new_name = f"{base_name}_{timestamp}"
             
-            # Ensure the sent directory exists
-            sent_dir = os.path.join(DIRECTORY_PATH, "sent")
+            sent_dir = os.path.join(CO_PROFILES_DIR, "sent")
             if not os.path.exists(sent_dir):
                 os.makedirs(sent_dir)
                 
@@ -268,9 +873,28 @@ class FlameBatchJsonEditor(QtWidgets.QDialog):
             
             with open(new_file_path, 'w') as f:
                 f.write(json_string)
+
+            # --- Inject & Execute Workflow via ComfyAPI ---
+            workflow_name = self.data.get("CO_WorkflowName")
+            if workflow_name and workflow_name != "Unnamed Workflow":
+                cfg = ConfigManager()
+                wf_path = os.path.join(cfg.workflows_dir, f"{workflow_name}.json")
+                if os.path.exists(wf_path):
+                    wf, is_api = WorkflowModifier.load_workflow(wf_path)
+                    if wf:
+                        if not is_api:
+                            wf = WorkflowModifier.convert_to_api(wf)
+                            is_api = True
+                        if wf:
+                            # Inject the sidecar JSON profile path into ComfyUI
+                            wf = WorkflowModifier.inject_profile_path(wf, is_api, new_file_path)
+                            ComfyAPI.execute_workflow(wf, workflow_name)
+                else:
+                    log(f"Warning: Workflow file not found at {wf_path}")
+            # ----------------------------------------------
             
             # Create Flame Note Node
-            if flame.batch:
+            if flame and hasattr(flame, 'batch') and flame.batch:
                 note_node = flame.batch.create_node("Note")
                 note_node.name = new_name
                 note_node.note_collapsed = True
@@ -289,9 +913,7 @@ class FlameBatchJsonEditor(QtWidgets.QDialog):
                 except AttributeError:
                     note_node.note.value = json_string
 
-            # Trigger a sidebar refresh to show the newly created file
             self.scan_directory()
-
             QtWidgets.QMessageBox.information(self, "Success", f"Sent to ComfyUI successfully!\n\nFile saved to sent folder: {new_name}.json\nNode created: {new_name}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Save Error", f"Failed to send to ComfyUI:\n{str(e)}")
@@ -316,24 +938,254 @@ class FlameBatchJsonEditor(QtWidgets.QDialog):
 
         super().keyPressEvent(event)
 
-# --- FLAME BATCH HOOK ---
 
-_editor_window = None 
+# ================== EXPORT & INTEGRATION PIPELINE ==================
 
-def launch_editor(selection):
-    global _editor_window
-    _editor_window = FlameBatchJsonEditor(selection)
-    _editor_window.show()
+def export_clip(clip, export_folder, frame_range=None):
+    cfg = ConfigManager()
+    preset = cfg.get_preset_path(cfg.get('export_format', 'PNG 8-bit'))
+    clip_name = sanitize_filename(_get_flame_attr_str(clip.name))
+    
+    seq_dir = os.path.join(export_folder, clip_name)
+    os.makedirs(seq_dir, exist_ok=True)
+    
+    if flame:
+        exporter = flame.PyExporter()
+        exporter.foreground = True
+        
+        try:
+            if frame_range is not None:
+                exporter.export_between_marks = True
+                dup = flame.duplicate(clip)
+                try:
+                    dup.name = clip.name
+                    if frame_range == (0, 0):
+                        ct = _safe_int_from_pytime(clip.current_time)
+                        dup.in_mark, dup.out_mark = ct, ct + 1
+                    else:
+                        dup.in_mark, dup.out_mark = frame_range[0], frame_range[1] + 1
+                    exporter.export(dup, preset, seq_dir)
+                finally:
+                    flame.delete(dup)
+            else:
+                exporter.export(clip, preset, seq_dir)
+            return seq_dir
+        except Exception as e:
+            log(f"Export Error: {e}")
+            return None
+    return None
+
+def export_sidecar_file(seq_dir, clip, workflow_name, mux_notes):
+    sidecar_path = os.path.join(seq_dir, f"{_get_flame_attr_str(clip.name)}_sidecar.json")
+    
+    metadata = {
+        "flame_clip_name" : _get_flame_attr_str(clip.name),
+        "workflow_name" : workflow_name,
+        "mux_notes": mux_notes,
+        "timestamp" : datetime.datetime.now().strftime("%Y%m%d_%H%M%S"),
+        "frame_count" : _safe_int_from_pytime(clip.duration),
+        "import_path" : seq_dir,
+        "workstation_name" : sanitize_hostname(socket.gethostname().replace(".local", "")),
+        "output_path" : f"/01_OUTPOST_STORE/01_OUTPOST/02_POST/ComfyUI/output/ToFlame_{sanitize_hostname(socket.gethostname().replace('.local', ''))}/{_get_flame_attr_str(clip.name)}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}/"
+    }
+
+    with open(sidecar_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    log(f"sidecar written to {sidecar_path}")
+
+def wait_for_sequence(seq_dir, timeout=FILE_WAIT_TIMEOUT):
+    start = time.time()
+    while time.time() - start < timeout:
+        if os.path.exists(seq_dir):
+            files = [f for f in os.listdir(seq_dir) if f.lower().endswith(('.png', '.exr', '.tif'))]
+            if files:
+                sz = sum(os.path.getsize(os.path.join(seq_dir, f)) for f in files)
+                time.sleep(0.5)
+                files2 = [f for f in os.listdir(seq_dir) if f.lower().endswith(('.png', '.exr', '.tif'))]
+                sz2 = sum(os.path.getsize(os.path.join(seq_dir, f)) for f in files2)
+                if len(files) == len(files2) and sz == sz2 and sz > 0:
+                    return seq_dir
+        time.sleep(0.5)
+    return None
+
+def export_and_load_workflow(selection, w_name, w_path, mode="auto"):
+    cfg = ConfigManager()
+    log(f"EXPORT TO COMFYUI - WORKFLOW: {w_name} [{mode.upper()}]")
+    
+    try:
+        with open(w_path, 'r') as f:
+            wf = json.load(f)
+    except Exception as e:
+        log(f"Error loading workflow: {e}")
+        return
+
+    mux_notes = get_mux_notes()
+    iterations = 1
+    if mux_notes and 'ITERATIONS' in mux_notes:
+        try: iterations = int(mux_notes['ITERATIONS'])
+        except ValueError: pass
+
+    clips = [get_clip_from_item(i) for i in selection if get_clip_from_item(i)]
+    if not clips:
+        log("No valid clips in selection.")
+        for i in range(iterations):
+            ComfyAPI.execute_workflow(wf, w_name)
+        return
+
+    for clip in clips:
+        seq_dir = export_clip(clip, cfg.input_dir)
+        if not seq_dir: continue
+        seq_dir = wait_for_sequence(seq_dir)
+        if seq_dir:
+            export_sidecar_file(seq_dir, clip, w_name, mux_notes)
+        if not seq_dir: continue
+        
+        c_name = os.path.basename(seq_dir)
+        if mode == "auto":
+            for i in range(iterations):
+                ComfyAPI.execute_workflow(wf, w_name)
+        else:
+            ComfyAPI.prepare_manual_workflow(w_path, w_name, c_name)
+            import webbrowser
+            webbrowser.open(cfg.url)
+            break
+
+# ================== FLAME MENU HOOKS ==================
+
+# Global reference to keep window active 
+_editor_window = None
+
+def get_media_panel_custom_ui_actions():
+    cfg = ConfigManager()
+    cfg.reload()
+    actions = []
+
+    def run_from_mux_note(selection):
+        wf_notes = get_mux_notes()
+        if not wf_notes or 'API' not in wf_notes:
+            log("No workflow specified in Mux Note (API) key. Cannot execute.")
+            return
+            
+        wf_name = wf_notes['API']
+        wf_path = os.path.join(cfg.workflows_dir, wf_name + '.json')
+        if not os.path.exists(wf_path):
+            log(f"ERROR: Workflow file not found: {wf_path}")
+            return
+        
+        try:
+            with open(wf_path, 'r') as f:
+                wf_data = json.load(f)
+            mode = "auto" if "nodes" not in wf_data else "manual"
+        except Exception as e:
+            log(f"ERROR: Unable to load workflow: {wf_name} - {e}")
+            return
+            
+        export_and_load_workflow(selection, wf_name, wf_path, mode=mode)
+
+    actions.append({
+        'name': 'Run Workflow',
+        'execute': run_from_mux_note,
+        'minimumVersion': '2025'
+    })
+
+    return [{
+        'name': 'ComfyUI',
+        'actions': actions
+    }]
+
 
 def get_batch_custom_ui_actions():
+    """Combined Batch Actions under a single 'CO_Comfy2' menu."""
+    
+    def open_settings(selection):
+        dlg = ComfyUISettingsDialog()
+        try:
+            dlg.exec_()
+        except AttributeError:
+            dlg.exec()
+
+    def launch_editor(selection):
+        cfg = ConfigManager()
+        clips = [get_clip_from_item(i) for i in selection if get_clip_from_item(i)]
+        
+        clip_data_for_ui = []
+        
+        # Pre-export the clips before opening the editor
+        for clip in clips:
+            clip_name = sanitize_filename(_get_flame_attr_str(clip.name))
+            seq_dir = os.path.join(cfg.input_dir, clip_name)
+            
+            needs_export = True
+            
+            # Detect if already exported by checking if folder exists and has common image files
+            if os.path.exists(seq_dir) and any(f.lower().endswith(('.png', '.exr', '.tif', '.jpg')) for f in os.listdir(seq_dir)):
+                msg = QtWidgets.QMessageBox()
+                msg.setStyleSheet(UIUtils.get_flame_stylesheet())
+                msg.setWindowTitle("Overwrite Export?")
+                msg.setText(f"Clip '{clip_name}' has already been exported.\nDo you want to overwrite it?")
+                
+                # Add Yes, No, Cancel options
+                msg.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No | QtWidgets.QMessageBox.Cancel)
+                msg.setDefaultButton(QtWidgets.QMessageBox.No)
+                
+                try:
+                    choice = msg.exec_()
+                except AttributeError:
+                    choice = msg.exec()
+                
+                # Handle user choice
+                if choice == QtWidgets.QMessageBox.Cancel:
+                    log(f"Export process cancelled by user for clip '{clip_name}'. Aborting job.")
+                    return  # Abort entirely, don't open editor
+                elif choice == QtWidgets.QMessageBox.No:
+                    log(f"Skipping export for clip '{clip_name}'. Using existing frames.")
+                    needs_export = False
+            
+            # Export if requested
+            if needs_export:
+                log(f"Exporting '{clip_name}' to ComfyUI input...")
+                exported_dir = export_clip(clip, cfg.input_dir)
+                if exported_dir:
+                    wait_for_sequence(exported_dir)
+                    
+            clip_data_for_ui.append((clip_name, seq_dir))
+
+        # Launch editor once exports are confirmed/handled
+        global _editor_window
+        _editor_window = FlameBatchJsonEditor(selection, clip_data_for_ui)
+        _editor_window.show()
+
     return [
         {
-            "name": "Testing_CO_ComfyUI",
-            "actions": [
+            'name': 'CO_Comfy2',
+            'actions': [
                 {
-                    "name": "Send ComfyUI Job",
-                    "execute": lambda selection: launch_editor(selection)
+                    'name': 'Send ComfyUI Job',
+                    'execute': launch_editor
+                },
+                {
+                    'name': 'ComfyUI Settings...',
+                    'execute': open_settings,
+                    'minimumVersion': '2025'
                 }
             ]
         }
     ]
+
+def initialize():
+    cfg = ConfigManager()
+    log(f"ComfyUI Integration v{__version__} - LOADED")
+    os.makedirs(cfg.input_dir, exist_ok=True)
+    os.makedirs(cfg.workflows_dir, exist_ok=True)
+    
+    if cfg.get('auto_import') and comfy_watcher:
+        try:
+            comfy_watcher.start_watcher(cfg.output_dir, cfg.notification_file, cfg.pipeline_notification_file)
+            log("Watcher started.")
+        except Exception as e:
+            log(f"Watcher error: {e}")
+
+try:
+    initialize()
+except Exception as e:
+    log(f"Initialization ERROR: {e}")
