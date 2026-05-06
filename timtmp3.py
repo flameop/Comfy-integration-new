@@ -1055,45 +1055,6 @@ def export_and_load_workflow(selection, w_name, w_path, mode="auto"):
 # Global reference to keep window active 
 _editor_window = None
 
-def get_media_panel_custom_ui_actions():
-    cfg = ConfigManager()
-    cfg.reload()
-    actions = []
-
-    def run_from_mux_note(selection):
-        wf_notes = get_mux_notes()
-        if not wf_notes or 'API' not in wf_notes:
-            log("No workflow specified in Mux Note (API) key. Cannot execute.")
-            return
-            
-        wf_name = wf_notes['API']
-        wf_path = os.path.join(cfg.workflows_dir, wf_name + '.json')
-        if not os.path.exists(wf_path):
-            log(f"ERROR: Workflow file not found: {wf_path}")
-            return
-        
-        try:
-            with open(wf_path, 'r') as f:
-                wf_data = json.load(f)
-            mode = "auto" if "nodes" not in wf_data else "manual"
-        except Exception as e:
-            log(f"ERROR: Unable to load workflow: {wf_name} - {e}")
-            return
-            
-        export_and_load_workflow(selection, wf_name, wf_path, mode=mode)
-
-    actions.append({
-        'name': 'Run Workflow',
-        'execute': run_from_mux_note,
-        'minimumVersion': '2025'
-    })
-
-    return [{
-        'name': 'ComfyUI',
-        'actions': actions
-    }]
-
-
 def get_batch_custom_ui_actions():
     """Combined Batch Actions under a single 'CO_Comfy2' menu."""
     
