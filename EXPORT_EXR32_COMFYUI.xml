@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<preset version="14">
+    <type>image</type>
+    <comment>EXR 32-bit float Export for ComfyUI Integration</comment>
+    <video>
+        <fileType>OpenEXR</fileType>
+        <codec>727160</codec>
+        <namePattern>&lt;name&gt;</namePattern>
+        <compressionQuality>50</compressionQuality>
+        <includeAlpha>False</includeAlpha>
+        <overwriteWithVersions>False</overwriteWithVersions>
+        <posterFrame>False</posterFrame>
+        <useFrameAsPoster>1</useFrameAsPoster>
+        <resize>
+            <resizeType>fit</resizeType>
+            <resizeFilter>lanczos</resizeFilter>
+            <width>0</width>
+            <height>0</height>
+            <bitsPerChannel>32</bitsPerChannel>
+            <numChannels>3</numChannels>
+            <floatingPoint>True</floatingPoint>
+            <bigEndian>False</bigEndian>
+            <pixelRatio>1</pixelRatio>
+            <scanFormat>P</scanFormat>
+            <ResSelectorMode>3</ResSelectorMode>
+            <ResAdaptativeMode>0</ResAdaptativeMode>
+            <ResScalingMode>1</ResScalingMode>
+            <ResScalingValue>100</ResScalingValue>
+        </resize>
+    </video>
+    <n>
+        <framePadding>4</framePadding>
+        <startFrame>1</startFrame>
+        <frameIndex>0</frameIndex>
+    </n>
+</preset>

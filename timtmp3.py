@@ -3,11 +3,8 @@ from __future__ import print_function
 
 """
 ComfyUI Integration for Flame
-Version: 2.7.3 - Merged Script (Base Integration + Profile Editor)
-
-Description:
-  Export clips to ComfyUI, manage workflows, send JSON profiles as jobs, 
-  and track metadata via sidecar/note nodes.
+Version: 2.7.5 - Merged Script (Base Integration + Profile Editor + Auto-Watcher)
+Removed Batch Note Node creation. Fixed Watcher initialization and notification path logic.
 """
 
 import os
@@ -18,7 +15,8 @@ import json
 import platform
 import socket
 import urllib.request
-import urllib.error
+import shutil
+import traceback
 
 try:
     import flame
@@ -27,19 +25,13 @@ except ImportError:
 
 # Support both PySide6 (Newer Flame) and PySide2 (Older Flame)
 try:
-    from PySide6 import QtWidgets, QtCore, QtGui
+    from PySide6 import QtWidgets, QtCore
 except ImportError:
-    from PySide2 import QtWidgets, QtCore, QtGui
-
-try:
-    import comfy_watcher
-except ImportError:
-    comfy_watcher = None
-    print("[ComfyUI] Warning: comfy_watcher not available")
+    from PySide2 import QtWidgets, QtCore
 
 # ================== GLOBALS & CONSTANTS ==================
 
-__version__ = "2.7.3"
+__version__ = "2.7.5"
 
 _HOME = os.path.expanduser("~")
 _IS_LINUX = platform.system() == 'Linux'
@@ -91,7 +83,13 @@ FILE_WAIT_TIMEOUT = 60
 def log(msg):
     """Standardized logging function"""
     x = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[ComfyUI] {x}: {msg}")
+    full_msg = f"[ComfyUI] {x}: {msg}"
+    print(full_msg)
+    try:
+        if flame:
+            flame.messages.show_in_console(msg, duration=0)
+    except:
+        pass
 
 def sanitize_filename(name):
     """Sanitize filename"""
@@ -100,6 +98,16 @@ def sanitize_filename(name):
 def sanitize_hostname(name):
     """Sanitize hostname by removing non-alphanumeric characters except dots and hyphens"""
     return re.sub(r'[^a-zA-Z0-9.-]', "_", name)
+
+# ================== SEED QUEUE ==================
+
+_seed_queue = []
+
+def add_seed(seed):
+    _seed_queue.append(str(seed))
+
+def get_next_seed():
+    return _seed_queue.pop(0) if _seed_queue else "0"
 
 # ================== CONFIGURATION MANAGEMENT ==================
 
@@ -157,10 +165,12 @@ class ConfigManager:
 
     @property
     def notification_file(self):
+        # Directly append to the output dir without stripping the last folder
         return os.path.join(self.output_dir, 'notification.json')
 
     @property
     def pipeline_notification_file(self):
+        # Do the same for the pipeline path if one is set
         pipe_res = self.config.get('pipeline_result_path', '')
         if pipe_res:
             return os.path.join(pipe_res, 'notification.json')
@@ -187,26 +197,6 @@ def _get_flame_attr_str(attr):
         return val.strip("'\"")
     except Exception:
         return ''
-
-def get_mux_notes():
-    """Returns parsed notes from the first Mux Note node in the current Batch selection."""
-    try:
-        if not flame or not hasattr(flame, 'batch') or not flame.batch:
-            return None
-        selection = flame.batch.selected_nodes.get_value()
-        for node in selection:
-            if node.type == "Note":
-                notetext = node.note.get_value()
-                return _parse_note_text(notetext)
-    except Exception as e:
-        log(f"Error accessing Mux notes: {e}")
-    return None
-
-def _parse_note_text(raw_string):
-    """Parses a string with (KEY) VALUE formatting."""
-    pattern = r'^[ \t]*\(([^)]+)\)[ \t]*(.*?)(?=(?:^[ \t]*\()|\Z)'
-    matches = re.findall(pattern, raw_string, flags=re.MULTILINE | re.DOTALL)
-    return {key.strip(): value.strip() for key, value in matches}
 
 def get_clip_from_item(item):
     """Extract PyClip from different Flame object types robustly"""
@@ -237,6 +227,314 @@ def _safe_int_from_pytime(val):
         return int(val)
     except Exception:
         return 1
+
+# ================== WATCHER / AUTO-IMPORT ==================
+
+def _resolve_flame_tokens(path_template, clip_name=''):
+    result = path_template
+    now = datetime.datetime.now()
+    replacements = {
+        '<date>': now.strftime('%Y-%m-%d'),
+        '<time>': now.strftime('%H%M%S'),
+        '<YYYY>': now.strftime('%Y'),
+        '<YY>': now.strftime('%y'),
+        '<MM>': now.strftime('%m'),
+        '<DD>': now.strftime('%d'),
+        '<hh>': now.strftime('%H'),
+        '<mm>': now.strftime('%M'),
+        '<ss>': now.strftime('%S'),
+        '<clip name>': clip_name,
+    }
+    try:
+        if flame:
+            project = flame.project.current_project
+            replacements['<project>'] = _get_flame_attr_str(project.name)
+            try: replacements['<project nickname>'] = _get_flame_attr_str(project.nickname)
+            except: pass
+            try: replacements['<user>'] = _get_flame_attr_str(flame.users.current_user.name)
+            except: pass
+            try: replacements['<user nickname>'] = _get_flame_attr_str(flame.users.current_user.nickname)
+            except: pass
+            try: replacements['<workstation>'] = socket.gethostname()
+            except: pass
+            try:
+                if hasattr(flame, 'batch') and flame.batch:
+                    replacements['<batch name>'] = _get_flame_attr_str(flame.batch.name)
+            except: pass
+    except:
+        pass
+    for token, value in replacements.items():
+        result = result.replace(token, value)
+    return result
+
+def _build_import_pattern(folder_path, files):
+    """Build Flame-compatible import pattern from file list."""
+    if not files:
+        return None
+    if len(files) == 1:
+        return os.path.join(folder_path, files[0])
+    match = re.search(r'(\d{4,})\.[^\.]+$', files[0])
+    if match:
+        seq_num = match.group(1)
+        padding = len(seq_num)
+        last_match = re.search(r'(\d{4,})\.[^\.]+$', files[-1])
+        if last_match:
+            start_str = str(int(seq_num)).zfill(padding)
+            end_str = str(int(last_match.group(1))).zfill(padding)
+            ext_part = files[0][match.end(1):]
+            prefix = files[0][:match.start(1)]
+            pattern_name = f"{prefix}[{start_str}-{end_str}]{ext_part}"
+            return os.path.join(folder_path, pattern_name)
+    return os.path.join(folder_path, files[0])
+
+def _do_import_in_idle(notification, output_dir):
+    """Import function executed via flame.schedule_idle_event."""
+    if not flame:
+        log("[Watcher] Flame not available for import")
+        return
+
+    output_folder = notification.get('output_folder', '')
+    log(f"outfolder:{output_folder}")
+    clip_name = notification.get('clip_name', output_folder)
+    pipeline_folder = notification.get('pipeline_folder', '')
+    log(f"pipefolder:{pipeline_folder}")
+
+    # Determine source path: pipeline (network) or local
+    if pipeline_folder and os.path.exists(pipeline_folder):
+        folder_path = pipeline_folder
+        log(f"[Watcher] Importing from pipeline: {folder_path}")
+    else:
+        folder_path = os.path.join(output_dir, output_folder)
+        if pipeline_folder:
+            log(f"[Watcher] Pipeline path not accessible ({pipeline_folder}), using local")
+
+    if not os.path.exists(folder_path):
+        log(f"[Watcher] ERROR: Folder not found: {folder_path}")
+        return
+
+    timestamp = datetime.datetime.now().strftime("%H%M%S")
+    flame_seed = get_next_seed()
+    
+    new_name = f"{clip_name}_comfyui_{timestamp}_{flame_seed}"
+    log(f"[Watcher] Importing in idle: {clip_name}")
+
+    # Read config to determine import destination (read fresh)
+    cfg = ConfigManager()
+    import_destination = cfg.get('import_destination', 'batch')
+
+    try:
+        if import_destination == 'library':
+            workspace = flame.project.current_project.current_workspace
+
+            comfyui_lib = None
+            for lib in (workspace.libraries or []):
+                if _get_flame_attr_str(lib.name) == "ComfyUI":
+                    comfyui_lib = lib
+                    break
+
+            if comfyui_lib is None:
+                comfyui_lib = workspace.create_library("ComfyUI")
+                log("[Watcher] Library 'ComfyUI' created")
+
+            today = datetime.datetime.now().strftime("%Y-%m-%d")
+            date_folder = None
+            for folder in comfyui_lib.folders:
+                if _get_flame_attr_str(folder.name) == today:
+                    date_folder = folder
+                    break
+
+            if not date_folder:
+                date_folder = comfyui_lib.create_folder(today)
+
+            flame.import_clips(folder_path, date_folder)
+            log(f"[Watcher] Imported to Library > ComfyUI > {today}: {clip_name}")
+
+        else:
+            if not (hasattr(flame, 'batch') and flame.batch):
+                log("[Watcher] ComfyUI results ready — open a Batch to auto-import (retrying...)")
+                return  # early return: notification kept, watcher retries next tick
+
+            reel_name = "ComfyUI Results"
+
+            # Get or create reel
+            target_reel = None
+            for reel in flame.batch.reels:
+                if _get_flame_attr_str(reel.name) == reel_name:
+                    target_reel = reel
+                    break
+
+            if not target_reel:
+                target_reel = flame.batch.create_reel(reel_name)
+                log(f"[Watcher] Created reel: {reel_name}")
+
+            # Build import pattern
+            files = sorted([
+                f for f in os.listdir(folder_path)
+                if os.path.isfile(os.path.join(folder_path, f))
+            ])
+
+            import_path = _build_import_pattern(folder_path, files)
+            log(f"TD__Watcher_looking for folder {import_path}")
+            if not import_path:
+                log("[Watcher] ERROR: No files in result folder")
+                return
+
+            log(f"[Watcher] Importing: {import_path}")
+            batch_clip = flame.batch.import_clip(import_path, reel_name)
+
+            if batch_clip:
+                try:
+                    if hasattr(batch_clip, 'name'):
+                        if hasattr(batch_clip.name, 'set_value'):
+                            batch_clip.name.set_value(new_name)
+                        else:
+                            batch_clip.name = new_name
+                except:
+                    pass
+                log(f"[Watcher] Imported to Batch Reel: {new_name}")
+            else:
+                log("[Watcher] Import returned empty — check console")
+
+        # Notify user
+        try:
+            flame.messages.show_in_console(
+                f"ComfyUI result imported: {new_name}",
+                duration=5
+            )
+        except:
+            pass
+
+        # Clean notification files
+        for notif_path in [os.path.join(output_dir, 'notification.json')]:
+            try:
+                if os.path.exists(notif_path):
+                    os.remove(notif_path)
+            except:
+                pass
+
+    except Exception as e:
+        log(f"[Watcher] ERROR during idle import: {e}")
+        traceback.print_exc()
+
+class ComfyUIWatcher(QtCore.QObject):
+    def __init__(self, output_dir, notification_file, check_interval=3000, pipeline_notification_file=None):
+        # Explicitly parent to the main Flame app to prevent C++ garbage collection
+        app = QtCore.QCoreApplication.instance()
+        super().__init__(app)
+        
+        self.output_dir = output_dir
+        self.notification_file = notification_file
+        self.pipeline_notification_file = pipeline_notification_file
+        self.check_interval = check_interval
+        self.last_notification_time = None
+        self.imported_folders = set()
+
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self._check_notification)
+
+        paths_info = f"local: {notification_file}"
+        
+        if pipeline_notification_file:
+            paths_info += f" | pipeline: {pipeline_notification_file}"
+        log(f"[Watcher] Initialized - polling every {check_interval/1000}s")
+        log(f"[Watcher] Monitoring: {paths_info}")
+        log(f"output_dir: {output_dir}")
+        log(f"pipeline_notification_file: {pipeline_notification_file}")
+
+    def start(self):
+        if not self.timer.isActive():
+            self._clean_stale_notification()
+            self.timer.start(self.check_interval)
+            log("[Watcher] Started")
+
+    def stop(self):
+        if self.timer.isActive():
+            self.timer.stop()
+            log("[Watcher] Stopped")
+
+    def _clean_stale_notification(self):
+        for notif_path in [self.notification_file, self.pipeline_notification_file]:
+            if not notif_path or not os.path.exists(notif_path):
+                continue
+            try:
+                with open(notif_path, 'r') as f:
+                    data = json.load(f)
+                ts = data.get('timestamp', '')
+                folder = data.get('output_folder', '')
+                if folder:
+                    self.imported_folders.add(folder)
+                    self.last_notification_time = ts
+                os.remove(notif_path)
+                log(f"[Watcher] Cleaned stale notification: {folder} ({notif_path})")
+            except:
+                try:
+                    os.remove(notif_path)
+                except:
+                    pass
+
+    def _check_notification(self):
+        for notif_path in [self.notification_file, self.pipeline_notification_file]:
+            if not notif_path or not os.path.exists(notif_path):
+                continue
+            
+            try:
+                with open(notif_path, 'r') as f:
+                    notification = json.load(f)
+
+                timestamp = notification.get('timestamp', '')
+                output_folder = notification.get('output_folder', '')
+
+                if not output_folder:
+                    continue
+                if output_folder in self.imported_folders:
+                    try: os.remove(notif_path)
+                    except: pass
+                    continue
+                if self.last_notification_time and timestamp <= self.last_notification_time:
+                    continue
+
+                source = "pipeline" if notif_path == self.pipeline_notification_file else "local"
+                log(f"[Watcher] New notification ({source}): {output_folder}")
+
+                self.last_notification_time = timestamp
+                self.imported_folders.add(output_folder)
+                
+                try: os.remove(notif_path)
+                except: pass
+
+                if flame and hasattr(flame, 'schedule_idle_event'):
+                    flame.schedule_idle_event(
+                        lambda notif=notification, out_dir=self.output_dir:
+                            _do_import_in_idle(notif, out_dir)
+                    )
+                    log("[Watcher] Import scheduled for Flame idle loop")
+                else:
+                    log("[Watcher] flame.schedule_idle_event not available — manual import needed")
+                
+                return
+
+            except json.JSONDecodeError:
+                pass
+            except Exception as e:
+                log(f"[Watcher] Error: {e}")
+
+_watcher = None
+
+def start_watcher(output_dir, notification_file, pipeline_notification_file=None):
+    global _watcher
+    if _watcher:
+        _watcher.stop()
+    _watcher = ComfyUIWatcher(output_dir, notification_file, check_interval=3000,
+                               pipeline_notification_file=pipeline_notification_file)
+    _watcher.start()
+    return _watcher
+
+def stop_watcher():
+    global _watcher
+    if _watcher:
+        _watcher.stop()
+        _watcher = None
+
 
 # ================== UI UTILITIES & BASE CLASSES ==================
 
@@ -439,34 +737,6 @@ class ComfyAPI:
         except Exception as e:
             log(f"API Execution Error: {e}")
         return False
-
-    @staticmethod
-    def prepare_manual_workflow(workflow_path, workflow_name, clip_folder_name):
-        cfg = ConfigManager()
-        try:
-            with open(workflow_path, 'r') as f:
-                workflow = json.load(f)
-                
-            if 'nodes' in workflow:
-                for node in workflow.get('nodes', []):
-                    if node.get('type') == 'LoadExrSequence' and 'widgets_values' in node:
-                        node['widgets_values'][0] = False
-                        node['widgets_values'][1] = clip_folder_name
-                        
-            base = cfg.input_dir.rsplit('/input', 1)[0] if '/input' in cfg.input_dir else cfg.input_dir
-            temp_dir = os.path.join(base, 'user', 'default', 'workflows', 'flame_temp')
-            os.makedirs(temp_dir, exist_ok=True)
-            temp_name = f"{clip_folder_name}.json"
-            temp_path = os.path.join(temp_dir, temp_name)
-            
-            with open(temp_path, 'w') as f:
-                json.dump(workflow, f, indent=2)
-                
-            log(f"Manual workflow prepped: {temp_path}")
-            return temp_name
-        except Exception as e:
-            log(f"Error prepping manual workflow: {e}")
-            return None
 
 
 # ================== DIALOGS: SETTINGS ==================
@@ -823,7 +1093,7 @@ class FlameBatchJsonEditor(QtWidgets.QDialog):
                 self.entries[key] = combo_widget
                 continue
             
-            if key in ["CO_PosPrompt", "CO_Neg_Prompt", "CO_NegPrompt"]:
+            if key in ["CO_PosPrompt", "CO_NegPrompt"]:
                 text_widget = QtWidgets.QPlainTextEdit(val_str)
                 text_widget.setMinimumHeight(80) 
                 text_widget.setMaximumHeight(200) 
@@ -892,29 +1162,9 @@ class FlameBatchJsonEditor(QtWidgets.QDialog):
                 else:
                     log(f"Warning: Workflow file not found at {wf_path}")
             # ----------------------------------------------
-            
-            # Create Flame Note Node
-            if flame and hasattr(flame, 'batch') and flame.batch:
-                note_node = flame.batch.create_node("Note")
-                note_node.name = new_name
-                note_node.note_collapsed = True
-                
-                try:
-                    cursor_pos = flame.batch.cursor_position
-                    note_node.pos_x = cursor_pos[0]
-                    note_node.pos_y = cursor_pos[1]
-                except AttributeError:
-                    if self.selection:
-                        note_node.pos_x = self.selection[0].pos_x + 150
-                        note_node.pos_y = self.selection[0].pos_y
-                
-                try:
-                    note_node.note = json_string
-                except AttributeError:
-                    note_node.note.value = json_string
 
             self.scan_directory()
-            QtWidgets.QMessageBox.information(self, "Success", f"Sent to ComfyUI successfully!\n\nFile saved to sent folder: {new_name}.json\nNode created: {new_name}")
+            QtWidgets.QMessageBox.information(self, "Success", f"Sent to ComfyUI successfully!\n\nFile saved to sent folder: {new_name}.json")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Save Error", f"Failed to send to ComfyUI:\n{str(e)}")
 
@@ -975,24 +1225,6 @@ def export_clip(clip, export_folder, frame_range=None):
             return None
     return None
 
-def export_sidecar_file(seq_dir, clip, workflow_name, mux_notes):
-    sidecar_path = os.path.join(seq_dir, f"{_get_flame_attr_str(clip.name)}_sidecar.json")
-    
-    metadata = {
-        "flame_clip_name" : _get_flame_attr_str(clip.name),
-        "workflow_name" : workflow_name,
-        "mux_notes": mux_notes,
-        "timestamp" : datetime.datetime.now().strftime("%Y%m%d_%H%M%S"),
-        "frame_count" : _safe_int_from_pytime(clip.duration),
-        "import_path" : seq_dir,
-        "workstation_name" : sanitize_hostname(socket.gethostname().replace(".local", "")),
-        "output_path" : f"/01_OUTPOST_STORE/01_OUTPOST/02_POST/ComfyUI/output/ToFlame_{sanitize_hostname(socket.gethostname().replace('.local', ''))}/{_get_flame_attr_str(clip.name)}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}/"
-    }
-
-    with open(sidecar_path, "w") as f:
-        json.dump(metadata, f, indent=2)
-    log(f"sidecar written to {sidecar_path}")
-
 def wait_for_sequence(seq_dir, timeout=FILE_WAIT_TIMEOUT):
     start = time.time()
     while time.time() - start < timeout:
@@ -1007,48 +1239,6 @@ def wait_for_sequence(seq_dir, timeout=FILE_WAIT_TIMEOUT):
                     return seq_dir
         time.sleep(0.5)
     return None
-
-def export_and_load_workflow(selection, w_name, w_path, mode="auto"):
-    cfg = ConfigManager()
-    log(f"EXPORT TO COMFYUI - WORKFLOW: {w_name} [{mode.upper()}]")
-    
-    try:
-        with open(w_path, 'r') as f:
-            wf = json.load(f)
-    except Exception as e:
-        log(f"Error loading workflow: {e}")
-        return
-
-    mux_notes = get_mux_notes()
-    iterations = 1
-    if mux_notes and 'ITERATIONS' in mux_notes:
-        try: iterations = int(mux_notes['ITERATIONS'])
-        except ValueError: pass
-
-    clips = [get_clip_from_item(i) for i in selection if get_clip_from_item(i)]
-    if not clips:
-        log("No valid clips in selection.")
-        for i in range(iterations):
-            ComfyAPI.execute_workflow(wf, w_name)
-        return
-
-    for clip in clips:
-        seq_dir = export_clip(clip, cfg.input_dir)
-        if not seq_dir: continue
-        seq_dir = wait_for_sequence(seq_dir)
-        if seq_dir:
-            export_sidecar_file(seq_dir, clip, w_name, mux_notes)
-        if not seq_dir: continue
-        
-        c_name = os.path.basename(seq_dir)
-        if mode == "auto":
-            for i in range(iterations):
-                ComfyAPI.execute_workflow(wf, w_name)
-        else:
-            ComfyAPI.prepare_manual_workflow(w_path, w_name, c_name)
-            import webbrowser
-            webbrowser.open(cfg.url)
-            break
 
 # ================== FLAME MENU HOOKS ==================
 
@@ -1139,14 +1329,23 @@ def initialize():
     os.makedirs(cfg.input_dir, exist_ok=True)
     os.makedirs(cfg.workflows_dir, exist_ok=True)
     
-    if cfg.get('auto_import') and comfy_watcher:
+    if cfg.get('auto_import'):
         try:
-            comfy_watcher.start_watcher(cfg.output_dir, cfg.notification_file, cfg.pipeline_notification_file)
+            start_watcher(cfg.output_dir, cfg.notification_file, cfg.pipeline_notification_file)
             log("Watcher started.")
         except Exception as e:
             log(f"Watcher error: {e}")
 
-try:
-    initialize()
-except Exception as e:
-    log(f"Initialization ERROR: {e}")
+def app_initialized(project_name):
+    """Flame hook: triggered when the application UI is fully loaded."""
+    try:
+        initialize()
+    except Exception as e:
+        log(f"Initialization ERROR: {e}")
+
+# Catch-all: If the user manually "Rescans Python Hooks" while Flame is already running
+if flame and getattr(flame.project, 'current_project', None):
+    try:
+        initialize()
+    except Exception as e:
+        log(f"Initialization ERROR: {e}")
